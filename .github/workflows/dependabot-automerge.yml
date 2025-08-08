@@ -1,0 +1,56 @@
+name: Dependabot Auto-merge
+
+on:
+  pull_request:
+    types: [ opened, synchronize ]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+
+    steps:
+      # Solo hacer checkout si necesitamos probar
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      # Test rápido para validar que no rompe nada
+      - name: Quick test
+        run: |
+          go mod download
+          go test ./... -short  # Tests cortos solamente
+
+      # Obtener metadata de Dependabot
+      - name: Fetch metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+
+      # Auto-aprobar y mergear patches automáticamente
+      # Minor updates requieren aprobación manual
+      - name: Auto-merge patch updates
+        if: steps.metadata.outputs.update-type == 'version-update:semver-patch'
+        run: |
+          gh pr review --approve "$PR_URL"
+          gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Para minor/major, solo aprobar pero no mergear
+      - name: Approve minor updates
+        if: steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        run: |
+          gh pr review --approve "$PR_URL"
+          gh pr comment "$PR_URL" --body "✅ Minor update aprobado. Requiere merge manual."
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

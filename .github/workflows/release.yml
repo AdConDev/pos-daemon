@@ -1,107 +1,118 @@
-name: Automated Semantic Release
+name: Auto Release
 
 on:
-  pull_request:
-    types: [ closed ]
-    branches:
-      - master
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - '.github/**'
+      - '!.github/workflows/release.yml'
 
-# Define permisos específicos requeridos
 permissions:
   contents: write
-  pull-requests: write
+  packages: write
 
 jobs:
   release:
-    # Solo ejecutar cuando el PR se fusiona, no cuando se cierra sin fusión
-    if: github.event.pull_request.merged == true
+    name: Create Release
     runs-on: ubuntu-latest
-    name: Process New Release
-    
+    # Skip si el commit ya es de release o tiene [skip ci]
+    if: |
+      !contains(github.event.head_commit.message, 'chore(release)') &&
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      !contains(github.event.head_commit.message, '[skip release]')
+
     steps:
-      # Paso 1: Generar un nombre único para la rama temporal
-      - name: Generate unique branch name
-        id: branch-name
-        run: echo "branch_name=release-$(date +%s)-${{ github.run_id }}" >> $GITHUB_OUTPUT
-      
-      # Paso 2: Crear rama temporal
-      - name: Create temporary branch for release
-        uses: peterjgrainger/action-create-branch@v2.4.0
-        id: create-branch
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          branch: ${{ steps.branch-name.outputs.branch_name }}
-          sha: "${{ github.event.pull_request.head.sha }}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Paso 3: Checkout del código
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      # Configurar git para commits
+      - name: Setup Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # Setup Node para las herramientas de versionado
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          fetch-depth: 0 # Importante para tener historia completa para changelog
+          node-version: '20'
 
-      # Paso 4: Cambiar a la rama temporal
-      - name: Switch to release branch
+      # Instalar standard-version globalmente
+      - name: Install release tools
+        run: npm install -g standard-version
+
+      # Detectar el tipo de cambio basado en commits
+      - name: Analyze commits and determine release type
+        id: analyze
         run: |
-          git fetch --all
-          git checkout --track origin/${{ steps.branch-name.outputs.branch_name }}
-        continue-on-error: false
-
-      # Paso 5: Generar changelog y actualizar versión
-      - name: Generate changelog and bump version
-        id: changelog
-        uses: TriPSs/conventional-changelog-action@v3
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          version-file: "./package.json,./package-lock.json"
-          git-branch: ${{ steps.branch-name.outputs.branch_name }}
-          skip-on-empty: false
-          skip-git-pull: true
-          output-file: "CHANGELOG.md"
-
-      # Paso 6: Crear PR con información de versión
-      - name: Create Release PR
-        id: create-pr
-        run: |
-          gh pr create \
-            --base master \
-            --head ${{ steps.branch-name.outputs.branch_name }} \
-            --title "chore(release): prepare release ${{ steps.changelog.outputs.tag }}" \
-            --body "This PR updates version information and changelog for release ${{ steps.changelog.outputs.tag }}"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # Paso 7: Fusionar PR de release
-      - name: Merge Release PR
-        id: merge-pr
-        run: |
-          PR_NUMBER=$(gh pr list --head ${{ steps.branch-name.outputs.branch_name }} --json number -q ".[0].number")
-          if [ ! -z "$PR_NUMBER" ]; then
-            gh pr merge $PR_NUMBER --merge --delete-branch
-            echo "Merged PR #$PR_NUMBER"
+          # Obtener el último tag
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
+          
+          # Analizar commits desde el último tag
+          FEAT_COUNT=$(git log $LAST_TAG..HEAD --pretty=format:"%s" | grep -c "^feat" || true)
+          FIX_COUNT=$(git log $LAST_TAG..HEAD --pretty=format:"%s" | grep -c "^fix" || true)
+          BREAKING_COUNT=$(git log $LAST_TAG..HEAD --pretty=format:"%B" | grep -c "BREAKING CHANGE" || true)
+          
+          # Determinar si necesitamos release
+          if [ "$BREAKING_COUNT" -gt 0 ]; then
+            echo "release_type=major" >> $GITHUB_OUTPUT
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          elif [ "$FEAT_COUNT" -gt 0 ]; then
+            echo "release_type=minor" >> $GITHUB_OUTPUT
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          elif [ "$FIX_COUNT" -gt 0 ]; then
+            echo "release_type=patch" >> $GITHUB_OUTPUT
+            echo "should_release=true" >> $GITHUB_OUTPUT
           else
-            echo "No PR found to merge"
-            exit 1
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No hay cambios que requieran release" >> $GITHUB_STEP_SUMMARY
           fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+          # Resumen para el PR
+          echo "## 📊 Análisis de Commits" >> $GITHUB_STEP_SUMMARY
+          echo "- 🚀 Features: $FEAT_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "- 🐛 Fixes: $FIX_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "- 💥 Breaking: $BREAKING_COUNT" >> $GITHUB_STEP_SUMMARY
 
-      # Paso 8: Crear GitHub Release
-      - name: Create GitHub Release
-        if: steps.changelog.outputs.skipped == 'false'
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ steps.changelog.outputs.tag }}
-          name: Release ${{ steps.changelog.outputs.tag }}
-          body: ${{ steps.changelog.outputs.clean_changelog }}
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # Paso 9: Notificar resultado
-      - name: Notify on success
-        if: success()
+      # Generar release si es necesario
+      - name: Generate release
+        if: steps.analyze.outputs.should_release == 'true'
+        id: version
         run: |
-          echo "✅ Release ${{ steps.changelog.outputs.tag }} successfully created!"
-          echo "Changelog: ${{ steps.changelog.outputs.clean_changelog }}"
+          # Ejecutar standard-version con el tipo detectado
+          standard-version --release-as ${{ steps.analyze.outputs.release_type }} --skip.tag
+          
+          # Obtener la nueva versión
+          NEW_VERSION=$(node -p "require('./package.json').version")
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          
+          # Crear el tag
+          git tag -a "v$NEW_VERSION" -m "chore(release): v$NEW_VERSION"
+          
+          # Push cambios y tags
+          git push --follow-tags origin main
+
+      # Crear GitHub Release
+      - name: Create GitHub Release
+        if: steps.analyze.outputs.should_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.new_version }}
+          name: Release v${{ steps.version.outputs.new_version }}
+          body_path: CHANGELOG.md
+          generate_release_notes: false  # Usamos nuestro CHANGELOG
+          make_latest: true
+
+      # Notificar en el summary
+      - name: Release summary
+        if: steps.analyze.outputs.should_release == 'true'
+        run: |
+          echo "## ✅ Release Creado" >> $GITHUB_STEP_SUMMARY
+          echo "**Versión:** v${{ steps.version.outputs.new_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tipo:** ${{ steps.analyze.outputs.release_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "[Ver Release](https://github.com/${{ github.repository }}/releases/tag/v${{ steps.version.outputs.new_version }})" >> $GITHUB_STEP_SUMMARY
